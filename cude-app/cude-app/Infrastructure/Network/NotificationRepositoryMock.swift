@@ -1,6 +1,6 @@
 import Foundation
 
-public final class NotificationRepositoryMock: NotificationRepository, @unchecked Sendable {
+public final class NotificationRepositoryMock: @unchecked Sendable, NotificationRepository {
     public enum MockScenario: Int, CaseIterable {
         case empty
         case mixedWithUnread
@@ -12,7 +12,7 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
 
     public let name = "mock"
     public let failureRate: Double
-    public var onUpdate: (([NotificationItem]) -> Void)?
+    public var onUpdate: (([NotificationItemPayload]) -> Void)?
 
     private let (updateStream, updateContinuation) = AsyncStream.makeStream(of: Void.self)
 
@@ -21,7 +21,7 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
     }
 
     private var scenario: MockScenario
-    private var currentItems: [NotificationItem]
+    private var currentItems: [NotificationItemPayload]
 
     public init(
         initialScenario: MockScenario = .mixedWithUnread,
@@ -32,17 +32,16 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
         self.failureRate = failureRate
     }
 
-    public func fetchNotifications() async -> Result<[NotificationItem], RepositoryError> {
-        return .success(currentItems)
+    public func fetchNotifications() async throws -> [NotificationItemPayload] {
+        return currentItems
     }
 
-    public func submitFeedback(_ feedback: StatusFeedback) async -> Result<Void, RepositoryError> {
+    public func submitFeedback(_ feedback: StatusFeedback) async throws {
         if Double.random(in: 0...1) < failureRate {
-            return .failure(.networkError(underlying: URLError(.cannotConnectToHost)))
+            throw RepositoryError.networkError(underlying: URLError(.cannotConnectToHost))
         }
 
         _ = feedback
-        return .success(())
     }
 
     public func setScenario(_ newScenario: MockScenario) {
@@ -63,11 +62,11 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
     }
 
     public func addIncomingNotification(_ notification: NotificationItem) {
-        currentItems.insert(notification, at: 0)
+        currentItems.insert(.init(item: notification), at: 0)
         notifyUpdate(reason: "Incoming notification appended")
     }
 
-    public func buildDefaultFixtures() -> [MockScenario: [NotificationItem]] {
+    public func buildDefaultFixtures() -> [MockScenario: [NotificationItemPayload]] {
         [
             .empty: [],
             .mixedWithUnread: Self.defaultMixedItems,
@@ -91,7 +90,7 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
         updateContinuation.yield()
     }
 
-    private static func items(for scenario: MockScenario) -> [NotificationItem] {
+    private static func items(for scenario: MockScenario) -> [NotificationItemPayload] {
         switch scenario {
         case .empty:
             return []
@@ -104,9 +103,9 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
         }
     }
 
-    private static var defaultMixedItems: [NotificationItem] {
+    private static var defaultMixedItems: [NotificationItemPayload] {
         [
-            NotificationItem(
+            NotificationItemPayload(
                 id: "n-01",
                 title: "服务请求审批",
                 source: "HR 系统",
@@ -119,7 +118,7 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
                 replyDraft: nil,
                 updatedAt: Date()
             ),
-            NotificationItem(
+            NotificationItemPayload(
                 id: "n-02",
                 title: "代码评审提醒",
                 source: "Git 机器人",
@@ -132,7 +131,7 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
                 replyDraft: nil,
                 updatedAt: Date().addingTimeInterval(-420)
             ),
-            NotificationItem(
+            NotificationItemPayload(
                 id: "n-03",
                 title: "周报已归档",
                 source: "工作台",
@@ -148,9 +147,9 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
         ]
     }
 
-    private static var defaultAllReadItems: [NotificationItem] {
+    private static var defaultAllReadItems: [NotificationItemPayload] {
         [
-            NotificationItem(
+            NotificationItemPayload(
                 id: "n-11",
                 title: "日报已批阅",
                 source: "邮件",
@@ -163,7 +162,7 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
                 replyDraft: nil,
                 updatedAt: Date().addingTimeInterval(-12_000)
             ),
-            NotificationItem(
+            NotificationItemPayload(
                 id: "n-12",
                 title: "系统任务完成",
                 source: "任务平台",
@@ -179,10 +178,10 @@ public final class NotificationRepositoryMock: NotificationRepository, @unchecke
         ]
     }
 
-    private static var defaultItemsWithArrival: [NotificationItem] {
+    private static var defaultItemsWithArrival: [NotificationItemPayload] {
         let existing = defaultMixedItems
         return [
-            NotificationItem(
+            NotificationItemPayload(
                 id: "n-new",
                 title: "紧急告警",
                 source: "监控服务",

@@ -25,33 +25,42 @@ private func isFailure<T, E: Error>(_ result: Result<T, E>) -> Bool {
 }
 
 private actor SubmissionRepositoryStub: NotificationRepository {
-    private var fetchResult: Result<[NotificationItem], RepositoryError>
+    private var fetchResult: Result<[NotificationItemPayload], RepositoryError>
     private var submitPlan: [Result<Void, RepositoryError>]
     private var submitted: [StatusFeedback] = []
 
     init(
-        fetchResult: Result<[NotificationItem], RepositoryError> = .success([]),
+        fetchResult: Result<[NotificationItemPayload], RepositoryError> = .success([]),
         submitPlan: [Result<Void, RepositoryError>] = []
     ) {
         self.fetchResult = fetchResult
         self.submitPlan = submitPlan
     }
 
-    func fetchNotifications() async -> Result<[NotificationItem], RepositoryError> {
-        fetchResult
+    func fetchNotifications() async throws -> [NotificationItemPayload] {
+        switch fetchResult {
+        case let .success(items):
+            return items
+        case let .failure(error):
+            throw error
+        }
     }
 
-    func submitFeedback(_ feedback: StatusFeedback) async -> Result<Void, RepositoryError> {
+    func submitFeedback(_ feedback: StatusFeedback) async throws {
         submitted.append(feedback)
 
         if !submitPlan.isEmpty {
-            return submitPlan.removeFirst()
+            let next = submitPlan.removeFirst()
+            switch next {
+            case .success:
+                return
+            case let .failure(error):
+                throw error
+            }
         }
-
-        return .success(())
     }
 
-    func setFetchResult(_ value: Result<[NotificationItem], RepositoryError>) {
+    func setFetchResult(_ value: Result<[NotificationItemPayload], RepositoryError>) {
         fetchResult = value
     }
 
@@ -563,7 +572,7 @@ struct cude_appTests {
             )
         ]
         let repository = SubmissionRepositoryStub(
-            fetchResult: .success(remote),
+            fetchResult: .success(remote.map(NotificationItemPayload.init(item:))),
             submitPlan: [
                 .failure(.networkError(underlying: URLError(.cannotConnectToHost)))
             ]

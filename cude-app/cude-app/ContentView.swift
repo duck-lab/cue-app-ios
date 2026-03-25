@@ -621,6 +621,7 @@ struct ContentView: View {
         }
 
         syncSubmissionStateWithRuntimeQueue()
+        pruneStaleSubmissionStates()
 
         isLoading = false
         isRefreshing = false
@@ -728,5 +729,10 @@ struct ContentView: View {
         }
 
         submissionStates = nextStates
+    }
+
+    private func pruneStaleSubmissionStates() {
+        let validItemIDs = Set(persistedItems.map { $0.id })
+        submissionStates = submissionStates.filter { validItemIDs.contains($0.key) }
     }
 }

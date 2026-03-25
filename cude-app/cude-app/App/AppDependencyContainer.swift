@@ -97,6 +97,8 @@ public struct SubmissionDiagnostics: Sendable {
 public final class AppRuntime: ObservableObject {
     public let repository: NotificationRepository
     public let modelContainer: ModelContainer
+    private let notificationStoreManager: NotificationStoreManager
+    private let submissionQueueManager: SubmissionQueueManager
     public lazy var pollingScheduler: PollingScheduler = {
         PollingScheduler(
             intervalSeconds: AppFeatureFlags.pollingInterval,
@@ -141,26 +143,25 @@ public final class AppRuntime: ObservableObject {
     ) {
         self.repository = repository ?? AppDependencyContainer.makeRepository()
         modelContainer = AppDependencyContainer.makeModelContainer(inMemoryOnly: inMemoryOnly)
+        notificationStoreManager = NotificationStoreManager(modelContext: modelContainer.mainContext)
+        submissionQueueManager = SubmissionQueueManager(modelContext: modelContainer.mainContext)
         maxRetryAttempts = AppFeatureFlags.maxSubmissionRetryAttempts
         baseRetryDelaySeconds = AppFeatureFlags.baseRetryDelaySeconds
     }
 
     public func refreshNotificationStore() async -> Result<Void, Error> {
-        let result = await repository.fetchNotifications()
+        do {
+            let items = try await repository.fetchNotifications()
+            let pendingSubmissionIDs = submissionQueueManager.pendingNotificationIDs()
 
-        switch result {
-        case let .success(items):
-            do {
-                try mergeRemoteItemsIntoStore(items)
-                await processPendingSubmissions()
-                diagnostics.lastQueueEvent = "refresh_success"
-                return .success(())
-            } catch {
-                diagnostics.lastErrorMessage = error.localizedDescription
-                diagnostics.lastQueueEvent = "refresh_merge_failed"
-                return .failure(error)
-            }
-        case let .failure(error):
+            try notificationStoreManager.mergeRemoteItemsIntoStore(
+                items,
+                shouldKeepLocalStatusFor: pendingSubmissionIDs.contains
+            )
+            await processPendingSubmissions()
+            diagnostics.lastQueueEvent = "refresh_success"
+            return .success(())
+        } catch {
             diagnostics.lastErrorMessage = error.localizedDescription
             diagnostics.lastQueueEvent = "refresh_failed"
             await processPendingSubmissions()
@@ -169,68 +170,7 @@ public final class AppRuntime: ObservableObject {
     }
 
     public func clearAllNotifications() throws {
-        let descriptor = FetchDescriptor<NotificationItem>()
-        let existing = try modelContext.fetch(descriptor)
-
-        for item in existing {
-            modelContext.delete(item)
-        }
-
-        try modelContext.save()
-    }
-
-    private func mergeRemoteItemsIntoStore(_ remoteItems: [NotificationItem]) throws {
-        let descriptor = FetchDescriptor<NotificationItem>()
-        let existingItems = try modelContext.fetch(descriptor)
-        var existingByID = Dictionary(uniqueKeysWithValues: existingItems.map { ($0.id, $0) })
-        let incomingIDs = Set(remoteItems.map(\.id))
-
-        for item in remoteItems {
-            if let existing = existingByID.removeValue(forKey: item.id) {
-                let shouldKeepLocalStatus = pendingSubmission(for: item.id) != nil
-
-                existing.title = item.title
-                existing.source = item.source
-                existing.priority = item.priority
-                existing.timestamp = item.timestamp
-                existing.deadline = item.deadline
-                existing.extraInfo = item.extraInfo
-                if !shouldKeepLocalStatus {
-                    existing.status = item.status
-                    existing.unread = item.unread
-                }
-                existing.updatedAt = item.updatedAt
-
-                if existing.replyDraft == nil {
-                    existing.replyDraft = item.replyDraft
-                }
-
-                continue
-            }
-
-            let clone = NotificationItem(
-                id: item.id,
-                title: item.title,
-                source: item.source,
-                priority: item.priority,
-                timestamp: item.timestamp,
-                deadline: item.deadline,
-                extraInfo: item.extraInfo,
-                status: item.status,
-                unread: item.unread,
-                replyDraft: item.replyDraft,
-                updatedAt: item.updatedAt
-            )
-            modelContext.insert(clone)
-        }
-
-        for item in existingByID.values where !incomingIDs.contains(item.id) {
-            modelContext.delete(item)
-        }
-
-        if modelContext.hasChanges {
-            try modelContext.save()
-        }
+        try notificationStoreManager.clearAllNotifications()
     }
 
     public func submitStatus(
@@ -242,7 +182,7 @@ public final class AppRuntime: ObservableObject {
             diagnostics.totalSubmitAttempts += 1
             diagnostics.lastQueueEvent = "submit_started"
 
-            guard let item = try fetchNotification(by: itemID) else {
+            guard let item = try notificationStoreManager.fetchNotification(by: itemID) else {
                 diagnostics.totalSubmitFailure += 1
                 diagnostics.lastErrorMessage = RepositoryError.notFound.errorDescription
                 diagnostics.lastQueueEvent = "submit_missing_item"
@@ -252,19 +192,15 @@ public final class AppRuntime: ObservableObject {
             let normalizedComment = comment?.trimmingCharacters(in: .whitespacesAndNewlines)
             let commentToSend = normalizedComment?.isEmpty == true ? nil : normalizedComment
 
-            let previousStatus = item.status
-            item.status = status
+            do {
+                try item.updateStatus(to: status)
+            } catch {
+                // Keep optimistic status update for immediate UI feedback.
+                item.status = status
+            }
             item.unread = false
             item.replyDraft = commentToSend
             item.updatedAt = Date()
-
-            if item.status != previousStatus {
-                do {
-                    try item.updateStatus(to: status)
-                } catch {
-                    // Keep the optimistic local status so the UI still reflects the user's choice.
-                }
-            }
 
             let feedback = StatusFeedback(
                 notificationId: item.id,
@@ -273,14 +209,13 @@ public final class AppRuntime: ObservableObject {
                 timestamp: Date(),
                 clientMeta: ClientMeta(platform: currentPlatformName, version: currentVersion, device: currentDevice)
             )
-        
-            let result = await repository.submitFeedback(feedback)
-            switch result {
-            case .success:
+
+            do {
+                try await repository.submitFeedback(feedback)
                 diagnostics.totalSubmitSuccess += 1
                 diagnostics.lastQueueEvent = "submit_success"
                 diagnostics.lastErrorMessage = nil
-                removePendingSubmission(for: item.id)
+                submissionQueueManager.removePendingSubmission(for: item.id)
                 item.clearReplyDraftAfterSubmit()
 
                 if modelContext.hasChanges {
@@ -288,18 +223,19 @@ public final class AppRuntime: ObservableObject {
                 }
 
                 return .success(())
-            case let .failure(error):
+            } catch {
+                let repositoryError = toRepositoryError(error)
                 diagnostics.totalSubmitFailure += 1
-                diagnostics.lastErrorMessage = error.localizedDescription
-                let shouldRetry = error.isRetryable && maxRetryAttempts > 0
+                diagnostics.lastErrorMessage = repositoryError.localizedDescription
+                let shouldRetry = repositoryError.isRetryable && maxRetryAttempts > 0
                 if shouldRetry {
                     diagnostics.totalQueueEnqueued += 1
                     diagnostics.lastQueueEvent = "submit_failed_queued"
-                    enqueuePendingSubmission(
+                    submissionQueueManager.enqueuePendingSubmission(
                         for: item.id,
                         status: status,
                         comment: commentToSend,
-                        error: error,
+                        error: repositoryError,
                         clientMeta: feedback.clientMeta,
                         initialDelay: baseRetryDelaySeconds
                     )
@@ -312,7 +248,7 @@ public final class AppRuntime: ObservableObject {
                     try modelContext.save()
                 }
 
-                return .failure(error)
+                return .failure(repositoryError)
             }
         } catch {
             return .failure(error)
@@ -320,21 +256,14 @@ public final class AppRuntime: ObservableObject {
     }
 
     public func pendingSubmissions() -> [PendingStatusSubmission] {
-        do {
-            let descriptor = FetchDescriptor<PendingStatusSubmission>()
-            return try modelContext.fetch(descriptor)
-        } catch {
-            return []
-        }
+        submissionQueueManager.pendingSubmissions()
     }
 
     public func processPendingSubmissions(force: Bool = false) async {
         do {
             diagnostics.lastQueueEvent = "retry_cycle_started"
             let now = Date()
-            let descriptor = FetchDescriptor<PendingStatusSubmission>()
-            let allPending = try modelContext.fetch(descriptor)
-            let pendingItems = force ? allPending : allPending.filter { $0.nextRetryAt <= now }
+            let pendingItems = submissionQueueManager.pendingItems(dueBefore: now, force: force)
 
             for submission in pendingItems {
                 let feedback = StatusFeedback(
@@ -345,11 +274,10 @@ public final class AppRuntime: ObservableObject {
                     clientMeta: submission.clientMeta
                 )
 
-                let result = await repository.submitFeedback(feedback)
                 diagnostics.totalQueueReplayAttempts += 1
 
-                switch result {
-                case .success:
+                do {
+                    try await repository.submitFeedback(feedback)
                     let reachedRetryLimit = submission.attempts > 0
                         && maxRetryAttempts > 0
                         && submission.attempts >= maxRetryAttempts - 1
@@ -365,28 +293,30 @@ public final class AppRuntime: ObservableObject {
                     diagnostics.totalQueueReplaySuccess += 1
                     diagnostics.lastQueueEvent = "retry_success"
                     diagnostics.lastErrorMessage = nil
-                    if let item = try fetchNotification(by: submission.notificationId) {
+                    if let item = try notificationStoreManager.fetchNotification(by: submission.notificationId) {
                         item.clearReplyDraftAfterSubmit()
                     }
 
                     modelContext.delete(submission)
-                case let .failure(error):
-                    if error.isRetryable && submission.attempts + 1 < maxRetryAttempts {
+                } catch {
+                    let repositoryError = toRepositoryError(error)
+                    if repositoryError.isRetryable && submission.attempts + 1 < maxRetryAttempts {
                         diagnostics.totalQueueReplayFailure += 1
                         diagnostics.lastQueueEvent = "retry_scheduled"
                         submission.attempts += 1
                         submission.nextRetryAt = now.addingTimeInterval(
                             pow(2.0, Double(submission.attempts)) * baseRetryDelaySeconds
                         )
-                        submission.lastErrorMessage = error.localizedDescription
+                        submission.lastErrorMessage = repositoryError.localizedDescription
                         submission.updatedAt = now
                     } else {
                         diagnostics.totalQueueGivenUp += 1
                         diagnostics.lastQueueEvent = "retry_given_up"
-                        submission.lastErrorMessage = error.localizedDescription
+                        submission.lastErrorMessage = repositoryError.localizedDescription
                         submission.updatedAt = now
                     }
                 }
+                
             }
 
             if modelContext.hasChanges {
@@ -399,19 +329,21 @@ public final class AppRuntime: ObservableObject {
         }
     }
 
+    private func toRepositoryError(_ error: Error) -> RepositoryError {
+        error as? RepositoryError ?? RepositoryError.map(error)
+    }
+
     public func retryPendingSubmission(itemID: String) async -> Result<Void, Error> {
         do {
             diagnostics.totalManualRetryRequests += 1
-            let descriptor = FetchDescriptor<PendingStatusSubmission>()
-            let matches = try modelContext.fetch(descriptor).filter { $0.notificationId == itemID }
 
-            guard let submission = matches.first else {
+            guard submissionQueueManager.pendingSubmission(for: itemID) != nil else {
                 diagnostics.totalManualRetryMisses += 1
                 diagnostics.lastQueueEvent = "manual_retry_missing"
                 return .failure(RepositoryError.notFound)
             }
 
-            submission.nextRetryAt = Date()
+            submissionQueueManager.touchSubmission(for: itemID)
             try modelContext.save()
             diagnostics.lastQueueEvent = "manual_retry_requested"
             await processPendingSubmissions(force: true)
@@ -424,88 +356,25 @@ public final class AppRuntime: ObservableObject {
 
     public func clearPendingSubmission(for itemID: String) {
         diagnostics.lastQueueEvent = "clear_single_pending"
-        removePendingSubmission(for: itemID)
+        submissionQueueManager.removePendingSubmission(for: itemID)
         if modelContext.hasChanges {
             try? modelContext.save()
         }
     }
 
     public func pendingSubmission(for itemID: String) -> PendingStatusSubmission? {
-        do {
-            let descriptor = FetchDescriptor<PendingStatusSubmission>()
-            return try modelContext.fetch(descriptor).first(where: { $0.notificationId == itemID })
-        } catch {
-            return nil
-        }
+        submissionQueueManager.pendingSubmission(for: itemID)
     }
 
     public func clearAllPendingSubmissions() {
+        diagnostics.lastQueueEvent = "clear_all_pending"
         do {
-            diagnostics.lastQueueEvent = "clear_all_pending"
-            let descriptor = FetchDescriptor<PendingStatusSubmission>()
-            let existing = try modelContext.fetch(descriptor)
-            for item in existing {
-                modelContext.delete(item)
-            }
-
+            try submissionQueueManager.clearAll()
             if modelContext.hasChanges {
                 try modelContext.save()
             }
         } catch {
             print("[RetryQueue] clear failed: \(error)")
-        }
-    }
-
-    private func fetchNotification(by itemID: String) throws -> NotificationItem? {
-        let descriptor = FetchDescriptor<NotificationItem>()
-        let all = try modelContext.fetch(descriptor)
-        return all.first(where: { $0.id == itemID })
-    }
-
-    private func removePendingSubmission(for itemID: String) {
-        do {
-            diagnostics.lastQueueEvent = "remove_pending"
-            let descriptor = FetchDescriptor<PendingStatusSubmission>()
-            let existing = try modelContext.fetch(descriptor)
-
-            for item in existing where item.notificationId == itemID {
-                modelContext.delete(item)
-            }
-        } catch {
-            print("[RetryQueue] remove failed: \(error)")
-        }
-    }
-
-    private func enqueuePendingSubmission(
-        for itemID: String,
-        status: NotificationStatus,
-        comment: String?,
-        error: RepositoryError,
-        clientMeta: ClientMeta,
-        initialDelay: TimeInterval
-    ) {
-        do {
-            diagnostics.lastQueueEvent = "enqueue_pending"
-            let descriptor = FetchDescriptor<PendingStatusSubmission>()
-            let existing = try modelContext.fetch(descriptor)
-
-            for item in existing where item.notificationId == itemID {
-                modelContext.delete(item)
-            }
-
-            let submission = PendingStatusSubmission(
-                notificationId: itemID,
-                targetStatus: status,
-                comment: comment,
-                attempts: 0,
-                nextRetryAt: Date().addingTimeInterval(initialDelay),
-                lastErrorMessage: error.localizedDescription,
-                lastClientMeta: clientMeta
-            )
-
-            modelContext.insert(submission)
-        } catch {
-            print("[RetryQueue] enqueue failed: \(error)")
         }
     }
 
@@ -531,5 +400,194 @@ public final class AppRuntime: ObservableObject {
 
     private var currentVersion: String {
         "1.0.0"
+    }
+}
+
+@MainActor
+    public final class NotificationStoreManager {
+    private let modelContext: ModelContext
+
+    init(modelContext: ModelContext) {
+        self.modelContext = modelContext
+    }
+
+    public func clearAllNotifications() throws {
+        let descriptor = FetchDescriptor<NotificationItem>()
+        let existing = try modelContext.fetch(descriptor)
+
+        for item in existing {
+            modelContext.delete(item)
+        }
+
+        try modelContext.save()
+    }
+
+    public func fetchNotification(by itemID: String) throws -> NotificationItem? {
+        var descriptor = FetchDescriptor<NotificationItem>(
+            predicate: #Predicate { $0.id == itemID }
+        )
+        descriptor.fetchLimit = 1
+        
+        return try modelContext.fetch(descriptor).first
+    }
+
+    public func mergeRemoteItemsIntoStore(
+        _ remoteItems: [NotificationItemPayload],
+        shouldKeepLocalStatusFor: (String) -> Bool
+    ) throws {
+        let descriptor = FetchDescriptor<NotificationItem>()
+        let existingItems = try modelContext.fetch(descriptor)
+        var existingByID = Dictionary(uniqueKeysWithValues: existingItems.map { ($0.id, $0) })
+        let incomingIDs = Set(remoteItems.map(\.id))
+
+        for item in remoteItems {
+            if let existing = existingByID.removeValue(forKey: item.id) {
+                let shouldKeepLocalStatus = shouldKeepLocalStatusFor(item.id)
+
+                existing.title = item.title
+                existing.source = item.source
+                existing.priority = item.priority
+                existing.timestamp = item.timestamp
+                existing.deadline = item.deadline
+                existing.extraInfo = item.extraInfo
+                if !shouldKeepLocalStatus {
+                    existing.status = item.status
+                    existing.unread = item.unread
+                }
+                existing.updatedAt = item.updatedAt
+
+                if existing.replyDraft == nil {
+                    existing.replyDraft = item.replyDraft
+                }
+
+                continue
+            }
+
+            let clone = item.asNotificationItem()
+            modelContext.insert(clone)
+        }
+
+        for item in existingByID.values where !incomingIDs.contains(item.id) {
+            modelContext.delete(item)
+        }
+
+        if modelContext.hasChanges {
+            try modelContext.save()
+        }
+    }
+}
+
+@MainActor
+public final class SubmissionQueueManager {
+    private let modelContext: ModelContext
+
+    init(modelContext: ModelContext) {
+        self.modelContext = modelContext
+    }
+
+    public func pendingSubmissions() -> [PendingStatusSubmission] {
+        do {
+            let descriptor = FetchDescriptor<PendingStatusSubmission>()
+            return try modelContext.fetch(descriptor)
+        } catch {
+            return []
+        }
+    }
+
+    public func pendingSubmission(for itemID: String) -> PendingStatusSubmission? {
+        do {
+            var descriptor = FetchDescriptor<PendingStatusSubmission>(
+                predicate: #Predicate { $0.notificationId == itemID }
+            )
+            descriptor.fetchLimit = 1
+            return try modelContext.fetch(descriptor).first
+        } catch {
+            return nil
+        }
+    }
+
+    public func pendingNotificationIDs() -> Set<String> {
+        Set(pendingSubmissions().map(\.notificationId))
+    }
+
+    public func pendingItems(dueBefore date: Date, force: Bool) -> [PendingStatusSubmission] {
+        do {
+            if force {
+                return pendingSubmissions()
+            }
+
+            let predicate = #Predicate { (item: PendingStatusSubmission) in
+                item.nextRetryAt <= date
+            }
+            let descriptor = FetchDescriptor<PendingStatusSubmission>(predicate: predicate)
+            return try modelContext.fetch(descriptor)
+        } catch {
+            return []
+        }
+    }
+
+    public func clearAll() throws {
+        let descriptor = FetchDescriptor<PendingStatusSubmission>()
+        let existing = try modelContext.fetch(descriptor)
+
+        for item in existing {
+            modelContext.delete(item)
+        }
+    }
+
+    public func removePendingSubmission(for itemID: String) {
+        let descriptor = FetchDescriptor<PendingStatusSubmission>(
+            predicate: #Predicate { $0.notificationId == itemID }
+        )
+        let existing = (try? modelContext.fetch(descriptor)) ?? []
+
+        for item in existing {
+            modelContext.delete(item)
+        }
+    }
+
+    public func enqueuePendingSubmission(
+        for itemID: String,
+        status: NotificationStatus,
+        comment: String?,
+        error: RepositoryError,
+        clientMeta: ClientMeta,
+        initialDelay: TimeInterval
+    ) {
+        do {
+            let descriptor = FetchDescriptor<PendingStatusSubmission>(
+                predicate: #Predicate { $0.notificationId == itemID }
+            )
+            let existing = try modelContext.fetch(descriptor)
+
+            for item in existing {
+                modelContext.delete(item)
+            }
+
+            let submission = PendingStatusSubmission(
+                notificationId: itemID,
+                targetStatus: status,
+                comment: comment,
+                attempts: 0,
+                nextRetryAt: Date().addingTimeInterval(initialDelay),
+                lastErrorMessage: error.localizedDescription,
+                lastClientMeta: clientMeta
+            )
+
+            modelContext.insert(submission)
+        } catch {
+            print("[RetryQueue] enqueue failed: \(error)")
+        }
+    }
+
+    public func touchSubmission(for itemID: String) {
+        let descriptor = FetchDescriptor<PendingStatusSubmission>(
+            predicate: #Predicate { $0.notificationId == itemID }
+        )
+        let existing = (try? modelContext.fetch(descriptor)) ?? []
+
+        for item in existing {
+            item.nextRetryAt = Date()
+        }
     }
 }

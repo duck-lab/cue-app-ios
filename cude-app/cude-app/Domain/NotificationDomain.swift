@@ -66,6 +66,76 @@ public struct StatusFeedback: Codable, Equatable, Sendable {
     }
 }
 
+public struct NotificationItemPayload: Codable, Equatable, Sendable {
+    public let id: String
+    public let title: String
+    public let source: String
+    public let priority: NotificationPriority
+    public let timestamp: Date
+    public let deadline: Date?
+    public let extraInfo: String
+    public let status: NotificationStatus
+    public let unread: Bool
+    public let replyDraft: String?
+    public let updatedAt: Date
+
+    public init(
+        id: String,
+        title: String,
+        source: String,
+        priority: NotificationPriority,
+        timestamp: Date,
+        deadline: Date?,
+        extraInfo: String,
+        status: NotificationStatus,
+        unread: Bool,
+        replyDraft: String?,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.title = title
+        self.source = source
+        self.priority = priority
+        self.timestamp = timestamp
+        self.deadline = deadline
+        self.extraInfo = extraInfo
+        self.status = status
+        self.unread = unread
+        self.replyDraft = replyDraft
+        self.updatedAt = updatedAt
+    }
+
+    public init(item: NotificationItem) {
+        id = item.id
+        title = item.title
+        source = item.source
+        priority = item.priority
+        timestamp = item.timestamp
+        deadline = item.deadline
+        extraInfo = item.extraInfo
+        status = item.status
+        unread = item.unread
+        replyDraft = item.replyDraft
+        updatedAt = item.updatedAt
+    }
+
+    public func asNotificationItem() -> NotificationItem {
+        NotificationItem(
+            id: id,
+            title: title,
+            source: source,
+            priority: priority,
+            timestamp: timestamp,
+            deadline: deadline,
+            extraInfo: extraInfo,
+            status: status,
+            unread: unread,
+            replyDraft: replyDraft,
+            updatedAt: updatedAt
+        )
+    }
+}
+
 @Model
 public final class NotificationItem {
     @Attribute(.unique) public var id: String

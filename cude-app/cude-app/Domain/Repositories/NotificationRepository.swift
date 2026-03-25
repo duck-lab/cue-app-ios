@@ -1,9 +1,9 @@
 import Foundation
 
 public protocol NotificationRepository: Sendable {
-    func fetchNotifications() async -> Result<[NotificationItem], RepositoryError>
+    func fetchNotifications() async throws -> [NotificationItemPayload]
 
-    func submitFeedback(_ feedback: StatusFeedback) async -> Result<Void, RepositoryError>
+    func submitFeedback(_ feedback: StatusFeedback) async throws
 }
 
 public extension NotificationRepository {
